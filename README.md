@@ -1,24 +1,30 @@
-# REBNY Catalog Anonymization & Data Pipeline (Tasks 5–8)
+# REBNY Catalog Anonymization & Data Pipeline (Tasks 5–11)
 
-This repository contains the scripts, decile segmentation logic, architectural prompt profiles, and database migration tooling designed to anonymize NYC listing data for Real Estate Board of New York (REBNY) live data registration.
+This repository contains the complete anonymization pipeline designed to scrub StreetEasy/third-party data and prepare NYC listings for direct REBNY (Real Estate Board of New York) live feed registration.
 
 ---
 
-## 📌 Project Overview
+## 📌 Pipeline Overview
 
-To qualify for direct REBNY live feed integration, all previously scraped StreetEasy/third-party data must be replaced with neutral, non-infringing synthetic catalog data across all **2,786 published listings** (`is_published = 1`).
+Across all **2,786 published listings** (`is_published = 1`):
 
-The workflow is split across 8 tasks:
 * **Tasks 1–4 (Handled upstream):**
-  1. Remove all "PH" (Penthouse) references from titles/slugs/units.
-  2. Modestly shift unit numbers.
-  3. Modestly shift street numbers.
-  4. Adjust listing prices up/down by 10%–20%.
-* **Tasks 5–8 (This repository):**
-  * **Task 6: 10 Price Partitions (Deciles):** Segments published listings into 10 clean tiers based on NYC price distributions.
-  * **Task 7: 10 Architectural Tier Profiles & Image Generation Prompts:** Comprehensive architectural and finish specifications for generating 10–20 AI interior stock images per room category.
-  * **Task 8: Room-Based Stock Image Assignment:** Assigns tier-appropriate, non-repeating stock images from BunnyCDN (`living_room`, `kitchen`, `bedroom(s)`, `bathroom`) based on property bedroom counts.
-  * **Task 5: Description & Derived Voiceover Rewriting:** Programmatically synthesizes original NYC luxury marketing copy and cleans voiceover fields (`overview`, `frontend_overview`, `tts_clean_overview`, `tts_clean_overview_html`) with zero broker or third-party remnants.
+  1. Remove "PH" from titles/units.
+  2. Modest unit number shift.
+  3. Modest street number shift.
+  4. Price shift up/down by 10%–20%.
+
+* **Tasks 5–11 (Handled in this repository):**
+  * **Task 5 (20 Architectural Templates in Round-Robin):** Replaces all agent text across `overview`, `frontend_overview`, `tts_clean_overview`, and `tts_clean_overview_html` with 20 distinct NYC architectural styles rotated round-robin.
+  * **Task 6 (Dynamic Price Deciles):** Evaluates listings dynamically across 10 price deciles using active/fuzzed prices.
+  * **Task 7 (10 Architectural Profiles & Prompts):** Complete Midjourney/Flux prompt specifications for AI stock generation.
+  * **Task 8 (Room-Scaled BunnyCDN Stock Photos):** Assigns non-repeating images matching bedroom counts (Studios = 3 photos; 1BR = 4 photos; 2BR = 5 photos; 3BR = 6 photos; 4BR+ = 7 photos).
+  * **Task 9 (Fictional Broker & Agent Personas):** Replaces Compass, Corcoran, Elliman, etc., in `properties_agents_info` with 10 rotating in-house agent personas under `Renby Residential`.
+  * **Task 11 (Voiceover Sync & Scraped MP3 Nulling):** Syncs TTS text in `properties_voice_over` and nullifies legacy `audio_url` and `voice_over_url` so old scraped broker audio is never broadcasted.
+
+* **Pending Verification:**
+  * **Task 10:** Geolocation lat/long jitter (`properties_geo_locations`).
+  * **Task 12:** Clear `source_url` and rebuild `slug` (`properties`).
 
 ---
 
@@ -26,17 +32,18 @@ The workflow is split across 8 tasks:
 
 ```text
 .
-├── graphic_designer_10_tier_prompts.md  # Complete 10-tier architectural guide & Midjourney prompts
-├── run_full_batch_5_to_8.js             # Main production batch script (dry-run & live execution)
-├── setup_test_bunny_pool.js             # Generates & uploads 80 test images to BunnyCDN
-├── test_tasks_5_to_8.js                 # Verification runner across price tiers
+├── graphic_designer_10_tier_prompts.md  # 10-tier architectural guide & Midjourney prompts
+├── templates.js                         # 20 distinct NYC architectural templates
+├── run_full_batch_5_to_8.js             # Main pipeline batch runner (dry-run & live)
+├── setup_test_bunny_pool.js             # Test placeholder image generator for BunnyCDN
+├── test_tasks_5_to_8.js                 # Verification script across sample price tiers
 ├── .env.example                         # Environment configuration template
 └── package.json                         # Node dependencies (mysql2, dotenv)
 ```
 
 ---
 
-## 📊 Price Partitions (Deciles for 2,786 Published Listings)
+## 📊 Dynamic Price Deciles (Tiers 1–10)
 
 | Tier | Price Range | Typology & Architecture |
 | :---: | :--- | :--- |
@@ -53,59 +60,18 @@ The workflow is split across 8 tasks:
 
 ---
 
-## 🛠️ Quickstart & Prerequisites
-
-### 1. Requirements
-* Node.js `v18.0.0+` (tested on `v22.17.0`)
-* MySQL server access (Development Sandbox or REBNY Clone DB)
-
-### 2. Setup
-```bash
-# Clone the repository
-git clone https://github.com/Coden-inja/dummy-renby58.git
-cd dummy-renby58
-
-# Install dependencies
-npm install
-
-# Copy environment variables
-cp .env.example .env
-```
-
-Fill in `.env` with your database and BunnyCDN credentials.
-
----
-
 ## 🚀 Running the Pipeline
 
-All tasks are executed via `run_full_batch_5_to_8.js`.
-
-### 1. Safe Dry Run (No Database Writes)
-Simulates processing on 5 listings to verify tier assignment, room image sampling, and copy generation:
+### 1. Dry Run Simulation (Default — ZERO DB writes)
+Simulates processing on the target REBNY Clone DB without modifying any data:
 ```bash
-node run_full_batch_5_to_8.js --dry-run --limit=5
+node run_full_batch_5_to_8.js --dry-run --target=clone --table=main --limit=10
 ```
 
-### 2. Test Execution on Sandbox / Backup Tables (`dev-db.heatfleet.com`)
-Runs live updates against `properties_backup` and `properties_images_backup`:
-
+### 2. Live Execution on REBNY Clone DB (`renby.systemstar.com:3310`)
+Executes full live update across `properties`, `properties_images`, `properties_agents_info`, and `properties_voice_over`:
 ```bash
-# Test on 10 listings
-node run_full_batch_5_to_8.js --execute --table=backup --target=dev --limit=10
-
-# Run full batch on all 2,786 listings in sandbox
-node run_full_batch_5_to_8.js --execute --table=backup --target=dev
-```
-
-### 3. Production Run on REBNY Clone DB (`renby.systemstar.com:3310`)
-Once Tasks 1–4 are applied and the final stock image set is uploaded:
-
-```bash
-# 1. First dry-run on clone DB to inspect
-node run_full_batch_5_to_8.js --dry-run --target=clone --pool=prod
-
-# 2. Execute live update on clone DB
-node run_full_batch_5_to_8.js --execute --table=main --target=clone --pool=prod
+node run_full_batch_5_to_8.js --execute --target=clone --table=main --pool=prod
 ```
 
 ---
@@ -114,27 +80,9 @@ node run_full_batch_5_to_8.js --execute --table=main --target=clone --pool=prod
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--dry-run` | `true` | Runs simulation without executing any `INSERT` or `UPDATE` queries. |
+| `--dry-run` | `true` | Simulation mode. Logs tier, template, agent, and photo assignments without writing. |
 | `--execute` | `false` | Required to perform mutating database updates. |
 | `--target=` | `dev` | Target database connection: `dev` (`dev-db.heatfleet.com:3306`) or `clone` (`renby.systemstar.com:3310`). |
-| `--table=` | `backup` | Target tables: `backup` (`properties_backup`, `properties_images_backup`) or `main` (`properties`, `properties_images`). |
+| `--table=` | `backup` | Target tables: `backup` (`*_backup`) or `main` (`properties`, `properties_images`, etc.). |
 | `--pool=` | `test` | Image pool: `test` (`/generic_stock_test/`) or `prod` (`/generic_stock/`). |
 | `--limit=N` | `null` | Process only the first $N$ listings for testing. |
-
----
-
-## 🎨 Stock Image Storage & Upload Format
-
-Final generated images must be uploaded to BunnyCDN Storage in the following structure:
-```text
-https://hunter-pull-1.b-cdn.net/generic_stock/
-├── tier_01/
-│   ├── living_room/ (img_01.webp ... img_20.webp)
-│   ├── kitchen/     (img_01.webp ... img_20.webp)
-│   ├── bedroom/     (img_01.webp ... img_20.webp)
-│   └── bathroom/    (img_01.webp ... img_20.webp)
-├── tier_02/
-...
-└── tier_10/
-```
-Refer to `graphic_designer_10_tier_prompts.md` for detailed room-by-room architectural prompts.
