@@ -1,0 +1,16 @@
+{
+  "name": "rebny-scripts",
+  "version": "1.0.0",
+  "main": "setup_test_bunny_pool.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^18.0.4",
+    "mysql2": "^3.24.5"
+  }
+}
