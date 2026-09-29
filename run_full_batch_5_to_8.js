@@ -1,5 +1,6 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
+const { generateDescription, TEMPLATES } = require('./templates');
 
 // Parse CLI Arguments
 const args = process.argv.slice(2);
@@ -39,7 +40,9 @@ const POOL_SIZE = poolArg === 'prod' ? 15 : 2;
 
 const propTable = tableArg === 'backup' ? 'properties_backup' : 'properties';
 const imgTable = tableArg === 'backup' ? 'properties_images_backup' : 'properties_images';
+const voTable = tableArg === 'backup' ? 'properties_voice_over_backup' : 'properties_voice_over';
 
+// Dynamic Tier Calculation strictly based on the listing's current/fuzzed price
 function getPriceTier(price) {
   const p = Number(price) || 0;
   if (p <= 500000) return 1;
@@ -54,54 +57,39 @@ function getPriceTier(price) {
   return 10;
 }
 
-function sampleListingImages(tier, bedrooms) {
+// Samples tier-appropriate room stock images with accurate bedroom scaling
+function sampleListingImages(tier, rawBeds) {
   const tierStr = `tier_${String(tier).padStart(2, '0')}`;
   const images = [];
+  const beds = parseInt(rawBeds, 10) || 0;
+
   const randIdx = () => String(Math.floor(Math.random() * POOL_SIZE) + 1).padStart(2, '0');
 
-  // 1 Living Room (position 0)
+  // 1. Living Room (Position 0 - Primary Hero)
   images.push({ category: 'living_room', url: `${CDN_BASE_URL}/${tierStr}/living_room/img_${randIdx()}.webp` });
-  // 1 Kitchen (position 1)
+
+  // 2. Kitchen (Position 1)
   images.push({ category: 'kitchen', url: `${CDN_BASE_URL}/${tierStr}/kitchen/img_${randIdx()}.webp` });
 
-  // Bedrooms (position 2 to N+1)
-  const bedCount = Math.max(1, Math.min(4, parseInt(bedrooms, 10) || 1));
-  for (let b = 1; b <= bedCount; b++) {
-    const idx = String(((b - 1) % POOL_SIZE) + 1).padStart(2, '0');
-    images.push({ category: 'bedroom', url: `${CDN_BASE_URL}/${tierStr}/bedroom/img_${idx}.webp` });
+  // 3. Bedrooms: 
+  // - If Studio (beds === 0): NO bedroom photo (3 photos total)
+  // - If 1BR+: 1 to 4 distinct bedroom photos
+  if (beds > 0) {
+    const bedPhotoCount = Math.min(4, beds);
+    for (let b = 1; b <= bedPhotoCount; b++) {
+      const idx = String(((b - 1) % POOL_SIZE) + 1).padStart(2, '0');
+      images.push({ category: 'bedroom', url: `${CDN_BASE_URL}/${tierStr}/bedroom/img_${idx}.webp` });
+    }
   }
 
-  // 1 Bathroom
-  images.push({ category: 'bathroom', url: `${CDN_BASE_URL}/${tierStr}/bathroom/img_${randIdx()}.webp` });
+  // 4. Bathrooms:
+  // - 1 standard bathroom photo (or 2 if 4+ beds luxury residence)
+  const bathPhotoCount = beds >= 4 ? 2 : 1;
+  for (let ba = 1; ba <= bathPhotoCount; ba++) {
+    images.push({ category: 'bathroom', url: `${CDN_BASE_URL}/${tierStr}/bathroom/img_${randIdx()}.webp` });
+  }
 
   return images;
-}
-
-function generateRewrittenCopy(prop) {
-  const neighborhood = prop.address_subdivision || prop.borough || 'Manhattan';
-  const beds = parseInt(prop.bedrooms, 10) || 1;
-  const baths = parseFloat(prop.total_bathrooms) || 1;
-  const address = prop.address_street || 'Prime Location';
-  const unit = prop.frontend_title_unit_number ? ` ${prop.frontend_title_unit_number}` : '';
-  const sqft = prop.sqft ? `${Number(prop.sqft).toLocaleString()} square feet` : null;
-
-  const bedText = beds === 0 ? 'Studio residence' : `${beds}-bedroom`;
-  const spaceClause = sqft ? `, encompassing approximately ${sqft}` : '';
-
-  const hook = `Ideally situated in the vibrant heart of ${neighborhood}, Residence${unit} at ${address} presents a beautifully proportioned ${bedText}${spaceClause}.`;
-  const livingText = `The expansive main living and dining area is flooded with natural light, offering an open, airy atmosphere tailored for effortless entertaining and everyday comfort. Contemporary hardwood flooring and refined architectural lines create an immediate sense of home.`;
-  const kitchenText = `A meticulously designed kitchen features polished stone countertops, custom cabinetry with premium hardware, and a suite of high-efficiency stainless steel appliances, blending culinary practicality with timeless modern design.`;
-  const privateText = beds > 1 
-    ? `The peaceful bedroom wing provides exceptional privacy. The primary suite features generous wardrobe storage and an en-suite spa bath appointed with tailored tilework and modern fixtures, complemented by bright, versatile secondary bedrooms.`
-    : `The private bedroom suite serves as a serene sanctuary, complete with spacious custom closets and an adjoining bathroom outfitted with elegant stonework and contemporary fixtures.`;
-  const buildingText = `Positioned in a premier full-service building with dedicated door service, concierge assistance, and close proximity to premier dining, shopping, and multiple transit routes, this home captures the quintessential New York lifestyle.`;
-
-  const overview = `${hook}\n\n${livingText}\n\n${kitchenText}\n\n${privateText}\n\n${buildingText}`;
-  const tts_clean_overview = `${hook} ${livingText} ${kitchenText} ${privateText} ${buildingText}`.replace(/\s+/g, ' ');
-  const tts_clean_overview_html = `<p>${hook}</p><p>${livingText}</p><p>${kitchenText}</p><p>${privateText}</p><p>${buildingText}</p>`;
-  const frontend_overview = `${hook} ${livingText}`;
-
-  return { overview, frontend_overview, tts_clean_overview, tts_clean_overview_html };
 }
 
 async function main() {
@@ -114,14 +102,24 @@ async function main() {
   console.log(`\n===============================================================`);
   console.log(`REBNY ANONYMIZATION BATCH RUNNER (TASKS 5 TO 8)`);
   console.log(`===============================================================`);
-  console.log(`Mode:        ${isDryRun ? 'DRY-RUN (Simulation Only - No DB writes)' : '*** LIVE EXECUTION ***'}`);
-  console.log(`Target DB:   ${targetArg.toUpperCase()} (${dbConfig.host}:${dbConfig.port} / ${dbConfig.database})`);
-  console.log(`Tables:      Properties: [${propTable}], Images: [${imgTable}]`);
-  console.log(`CDN Pool:    ${poolArg.toUpperCase()} (${CDN_BASE_URL})`);
-  if (limitVal) console.log(`Limit:       ${limitVal} listings`);
+  console.log(`Mode:           ${isDryRun ? 'DRY-RUN (Simulation Only - No DB writes)' : '*** LIVE EXECUTION ***'}`);
+  console.log(`Target DB:      ${targetArg.toUpperCase()} (${dbConfig.host}:${dbConfig.port} / ${dbConfig.database})`);
+  console.log(`Tables:         Properties: [${propTable}], Images: [${imgTable}]`);
+  console.log(`CDN Pool:       ${poolArg.toUpperCase()} (${CDN_BASE_URL}, pool size: ${POOL_SIZE})`);
+  console.log(`Templates:      20 Distinct Architectural Templates (Round-Robin)`);
+  if (limitVal) console.log(`Limit:          ${limitVal} listings`);
   console.log(`===============================================================\n`);
 
   const conn = await mysql.createConnection(dbConfig);
+
+  // Check if voice over table exists
+  let hasVoTable = false;
+  try {
+    const [tables] = await conn.query(`SHOW TABLES LIKE ?`, [voTable]);
+    hasVoTable = tables.length > 0;
+  } catch (e) {
+    hasVoTable = false;
+  }
 
   const queryLimit = limitVal ? `LIMIT ${limitVal}` : '';
   const [listings] = await conn.query(`
@@ -132,22 +130,30 @@ async function main() {
     ${queryLimit}
   `);
 
-  console.log(`Found ${listings.length} published listings to process.\n`);
+  console.log(`Found ${listings.length} published listings to process.`);
+  console.log(`Voice-over table [${voTable}]: ${hasVoTable ? 'Detected & Enabled' : 'Not present (skipping VO table sync)'}\n`);
 
   const tierCounts = {};
+  const templateUsage = {};
   let totalImagesGenerated = 0;
 
   for (let i = 0; i < listings.length; i++) {
     const prop = listings[i];
+
+    // Dynamic Tier strictly based on the listing's price
     const tier = getPriceTier(prop.price);
     tierCounts[tier] = (tierCounts[tier] || 0) + 1;
 
+    // Room-based image assignment with Studio & multi-bed scaling
     const images = sampleListingImages(tier, prop.bedrooms);
     totalImagesGenerated += images.length;
-    const copy = generateRewrittenCopy(prop);
+
+    // Round-robin selection across 20 distinct architectural templates
+    const desc = generateDescription(prop, i);
+    templateUsage[desc.templateIndex] = (templateUsage[desc.templateIndex] || 0) + 1;
 
     if (!isDryRun) {
-      // 1. Delete old images for this listing in target table
+      // 1. Delete old images for this listing
       await conn.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
 
       // 2. Insert new assigned images
@@ -175,12 +181,27 @@ async function main() {
             updated_at = NOW()
         WHERE id = ?
       `, [
-        copy.overview,
-        copy.frontend_overview,
-        copy.tts_clean_overview,
-        copy.tts_clean_overview_html,
+        desc.overview,
+        desc.frontend_overview,
+        desc.tts_clean_overview,
+        desc.tts_clean_overview_html,
         prop.id
       ]);
+
+      // 4. Update voiceover table if present
+      if (hasVoTable) {
+        await conn.query(`
+          UPDATE ${voTable}
+          SET tts_clean_overview = ?,
+              tts_clean_overview_html = ?,
+              updated_at = NOW()
+          WHERE property_id = ?
+        `, [
+          desc.tts_clean_overview,
+          desc.tts_clean_overview_html,
+          prop.id
+        ]);
+      }
     }
 
     if ((i + 1) % 250 === 0 || i === listings.length - 1) {
@@ -195,10 +216,14 @@ async function main() {
   for (let t = 1; t <= 10; t++) {
     console.log(`  Tier ${String(t).padStart(2, ' ')}: ${tierCounts[t] || 0} listings`);
   }
+  console.log(`\n20 Templates Distribution:`);
+  for (let tpl = 1; tpl <= TEMPLATES.length; tpl++) {
+    console.log(`  Template ${String(tpl).padStart(2, '0')}: ${templateUsage[tpl] || 0} uses`);
+  }
   console.log(`-------------------------------------------\n`);
 
   if (isDryRun) {
-    console.log(`✓ Dry run complete. No database records were modified.`);
+    console.log(`✓ Dry run complete. Zero database records were modified.`);
     console.log(`To execute live updates, pass the --execute flag.\n`);
   } else {
     console.log(`✓ Live batch update successfully completed!\n`);
