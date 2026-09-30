@@ -6,6 +6,7 @@ const { generateDescription, TEMPLATES } = require('./templates');
 const args = process.argv.slice(2);
 const isExecute = args.includes('--execute');
 const isDryRun = !isExecute || args.includes('--dry-run');
+const skipImages = args.includes('--skip-images');
 
 const targetArg = (args.find(a => a.startsWith('--target=')) || '--target=clone').split('=')[1];
 const tableArg = (args.find(a => a.startsWith('--table=')) || '--table=main').split('=')[1];
@@ -127,16 +128,15 @@ async function main() {
   }
 
   console.log(`\n===============================================================`);
-  console.log(`REBNY ANONYMIZATION BATCH PIPELINE (TASKS 5 TO 11)`);
+  console.log(`REBNY ANONYMIZATION BATCH PIPELINE (TASKS 5, 9, 11)`);
   console.log(`===============================================================`);
   console.log(`Mode:           ${isDryRun ? 'DRY-RUN (Simulation Only - ZERO DB writes)' : '*** LIVE EXECUTION ***'}`);
   console.log(`Target DB:      ${targetArg.toUpperCase()} (${dbConfig.host}:${dbConfig.port} / ${dbConfig.database})`);
-  console.log(`Core Tables:    Properties: [${propTable}], Images: [${imgTable}]`);
-  console.log(`Agents Table:   [${agentTable}]`);
-  console.log(`Voice Table:    [${voTable}]`);
-  console.log(`CDN Pool:       ${poolArg.toUpperCase()} (${CDN_BASE_URL}, pool size: ${POOL_SIZE})`);
+  console.log(`Core Tables:    Properties: [${propTable}]`);
+  console.log(`Image Table:    [${imgTable}] ${skipImages ? '(SKIPPED - Waiting for Graphic Designer)' : '(ACTIVE)'}`);
+  console.log(`Agents Table:   [${agentTable}] (Task 9: Renby Personas)`);
+  console.log(`Voice Table:    [${voTable}] (Task 11: TTS Sync & Mute)`);
   console.log(`Templates:      20 Distinct Architectural Templates (Round-Robin)`);
-  console.log(`Agent Personas: 10 Fictional In-House Personas (Renby Residential)`);
   if (limitVal) console.log(`Limit:          ${limitVal} listings`);
   console.log(`===============================================================\n`);
 
@@ -149,15 +149,27 @@ async function main() {
   const [voTables] = await conn.query(`SHOW TABLES LIKE ?`, [voTable]);
   const hasVoTable = voTables.length > 0;
 
-  // Detect schema for properties_images
-  const [imgCols] = await conn.query(`DESCRIBE ${imgTable}`);
-  const imgColNames = imgCols.map(c => c.Field);
-  const isCloneImgSchema = imgColNames.includes('image_url'); // Clone DB uses image_url, slug
+  // Detect properties table schema (check if tts_clean_overview_html is present in properties)
+  const [propCols] = await conn.query(`DESCRIBE ${propTable}`);
+  const propColNames = propCols.map(c => c.Field);
+  const hasHtmlInProp = propColNames.includes('tts_clean_overview_html');
+
+  let isCloneImgSchema = false;
+  if (!skipImages) {
+    const [imgCols] = await conn.query(`DESCRIBE ${imgTable}`);
+    const imgColNames = imgCols.map(c => c.Field);
+    isCloneImgSchema = imgColNames.includes('image_url');
+  }
 
   console.log(`Auxiliary Table Detection:`);
   console.log(`  - Agents Table [${agentTable}]: ${hasAgentTable ? 'DETECTED' : 'Not found (will skip)'}`);
   console.log(`  - Voice Table  [${voTable}]:  ${hasVoTable ? 'DETECTED' : 'Not found (will skip)'}`);
-  console.log(`  - Images Schema: [${isCloneImgSchema ? 'Clone DB Schema (image_url, slug)' : 'Dev DB Schema (original_url, large_url...)'}]\n`);
+  if (!skipImages) {
+    console.log(`  - Images Schema: [${isCloneImgSchema ? 'Clone DB Schema (image_url, slug)' : 'Dev DB Schema (original_url, large_url...)'}]`);
+  } else {
+    console.log(`  - Images: SKIPPED (Task 8 deferred until designer assets uploaded)`);
+  }
+  console.log('');
 
   const queryLimit = limitVal ? `LIMIT ${limitVal}` : '';
   const [listings] = await conn.query(`
@@ -182,10 +194,6 @@ async function main() {
     const tier = getPriceTier(prop.price);
     tierCounts[tier] = (tierCounts[tier] || 0) + 1;
 
-    // Task 8: Room-Based Stock Photo Sampling
-    const images = sampleListingImages(tier, prop.bedrooms);
-    totalImagesGenerated += images.length;
-
     // Task 5: 20 Templates Round Robin
     const desc = generateDescription(prop, i);
     templateUsage[desc.templateIndex] = (templateUsage[desc.templateIndex] || 0) + 1;
@@ -196,49 +204,69 @@ async function main() {
 
     // If LIVE execution:
     if (!isDryRun) {
-      // 1. Task 8: Replace images matching the exact target schema
-      await conn.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
-      for (let pos = 0; pos < images.length; pos++) {
-        if (isCloneImgSchema) {
-          await conn.query(`
-            INSERT INTO ${imgTable} (property_id, slug, image_url)
-            VALUES (?, ?, ?)
-          `, [
-            prop.id,
-            prop.slug || `property-${prop.id}`,
-            images[pos].url
-          ]);
-        } else {
-          await conn.query(`
-            INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
-          `, [
-            prop.id,
-            images[pos].url,
-            images[pos].url,
-            images[pos].url,
-            images[pos].url,
-            pos
-          ]);
+      // 1. Task 8: Replace images (only if NOT skipped)
+      if (!skipImages) {
+        const images = sampleListingImages(tier, prop.bedrooms);
+        totalImagesGenerated += images.length;
+        await conn.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
+        for (let pos = 0; pos < images.length; pos++) {
+          if (isCloneImgSchema) {
+            await conn.query(`
+              INSERT INTO ${imgTable} (property_id, slug, image_url)
+              VALUES (?, ?, ?)
+            `, [
+              prop.id,
+              prop.slug || `property-${prop.id}`,
+              images[pos].url
+            ]);
+          } else {
+            await conn.query(`
+              INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
+            `, [
+              prop.id,
+              images[pos].url,
+              images[pos].url,
+              images[pos].url,
+              images[pos].url,
+              pos
+            ]);
+          }
         }
       }
 
       // 2. Task 5: Update properties text
-      await conn.query(`
-        UPDATE ${propTable}
-        SET overview = ?,
-            frontend_overview = ?,
-            tts_clean_overview = ?,
-            tts_clean_overview_html = ?,
-            updated_at = NOW()
-        WHERE id = ?
-      `, [
-        desc.overview,
-        desc.frontend_overview,
-        desc.tts_clean_overview,
-        desc.tts_clean_overview_html,
-        prop.id
-      ]);
+      if (hasHtmlInProp) {
+        await conn.query(`
+          UPDATE ${propTable}
+          SET overview = ?,
+              frontend_overview = ?,
+              tts_clean_overview = ?,
+              tts_clean_overview_html = ?,
+              updated_at = NOW()
+          WHERE id = ?
+        `, [
+          desc.overview,
+          desc.frontend_overview,
+          desc.tts_clean_overview,
+          desc.tts_clean_overview_html,
+          prop.id
+        ]);
+      } else {
+        await conn.query(`
+          UPDATE ${propTable}
+          SET overview = ?,
+              frontend_overview = ?,
+              tts_clean_overview = ?,
+              updated_at = NOW()
+          WHERE id = ?
+        `, [
+          desc.overview,
+          desc.frontend_overview,
+          desc.tts_clean_overview,
+          prop.id
+        ]);
+      }
 
       // 3. Task 9: Anonymize Broker & Agent Info
       if (hasAgentTable) {
@@ -296,7 +324,11 @@ async function main() {
 
   console.log(`\n=================== BATCH SUMMARY ===================`);
   console.log(`Total Listings:           ${listings.length}`);
-  console.log(`Total Assigned Images:    ${totalImagesGenerated}`);
+  if (!skipImages) {
+    console.log(`Total Assigned Images:    ${totalImagesGenerated}`);
+  } else {
+    console.log(`Image Assignment:         SKIPPED (--skip-images active)`);
+  }
   console.log(`\nPrice Tier Distribution:`);
   for (let t = 1; t <= 10; t++) {
     console.log(`  Tier ${String(t).padStart(2, ' ')}: ${tierCounts[t] || 0} listings`);
