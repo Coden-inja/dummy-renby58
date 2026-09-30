@@ -13,6 +13,8 @@ const tableArg = (args.find(a => a.startsWith('--table=')) || '--table=main').sp
 const poolArg = (args.find(a => a.startsWith('--pool=')) || '--pool=test').split('=')[1];
 const limitArg = args.find(a => a.startsWith('--limit='));
 const limitVal = limitArg ? parseInt(limitArg.split('=')[1], 10) : null;
+const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
+const CONCURRENCY = concurrencyArg ? parseInt(concurrencyArg.split('=')[1], 10) : 15;
 
 // Database Configurations
 const DB_CONFIGS = {
@@ -128,10 +130,11 @@ async function main() {
   }
 
   console.log(`\n===============================================================`);
-  console.log(`REBNY ANONYMIZATION BATCH PIPELINE (TASKS 5, 9, 11)`);
+  console.log(`REBNY ANONYMIZATION HIGH-SPEED CONCURRENT PIPELINE`);
   console.log(`===============================================================`);
   console.log(`Mode:           ${isDryRun ? 'DRY-RUN (Simulation Only - ZERO DB writes)' : '*** LIVE EXECUTION ***'}`);
   console.log(`Target DB:      ${targetArg.toUpperCase()} (${dbConfig.host}:${dbConfig.port} / ${dbConfig.database})`);
+  console.log(`Concurrency:    ${CONCURRENCY} Parallel Workers`);
   console.log(`Core Tables:    Properties: [${propTable}]`);
   console.log(`Image Table:    [${imgTable}] ${skipImages ? '(SKIPPED - Waiting for Graphic Designer)' : '(ACTIVE)'}`);
   console.log(`Agents Table:   [${agentTable}] (Task 9: Renby Personas)`);
@@ -140,23 +143,29 @@ async function main() {
   if (limitVal) console.log(`Limit:          ${limitVal} listings`);
   console.log(`===============================================================\n`);
 
-  const conn = await mysql.createConnection(dbConfig);
+  // Create high-concurrency connection pool
+  const pool = mysql.createPool({
+    ...dbConfig,
+    waitForConnections: true,
+    connectionLimit: CONCURRENCY + 5,
+    queueLimit: 0
+  });
 
   // Detect availability of auxiliary tables
-  const [agentTables] = await conn.query(`SHOW TABLES LIKE ?`, [agentTable]);
+  const [agentTables] = await pool.query(`SHOW TABLES LIKE ?`, [agentTable]);
   const hasAgentTable = agentTables.length > 0;
 
-  const [voTables] = await conn.query(`SHOW TABLES LIKE ?`, [voTable]);
+  const [voTables] = await pool.query(`SHOW TABLES LIKE ?`, [voTable]);
   const hasVoTable = voTables.length > 0;
 
-  // Detect properties table schema (check if tts_clean_overview_html is present in properties)
-  const [propCols] = await conn.query(`DESCRIBE ${propTable}`);
+  // Detect properties table schema
+  const [propCols] = await pool.query(`DESCRIBE ${propTable}`);
   const propColNames = propCols.map(c => c.Field);
   const hasHtmlInProp = propColNames.includes('tts_clean_overview_html');
 
   let isCloneImgSchema = false;
   if (!skipImages) {
-    const [imgCols] = await conn.query(`DESCRIBE ${imgTable}`);
+    const [imgCols] = await pool.query(`DESCRIBE ${imgTable}`);
     const imgColNames = imgCols.map(c => c.Field);
     isCloneImgSchema = imgColNames.includes('image_url');
   }
@@ -172,7 +181,7 @@ async function main() {
   console.log('');
 
   const queryLimit = limitVal ? `LIMIT ${limitVal}` : '';
-  const [listings] = await conn.query(`
+  const [listings] = await pool.query(`
     SELECT id, title, slug, price, bedrooms, total_bathrooms, sqft, address_street, address_subdivision, borough, property_type, frontend_title_unit_number
     FROM ${propTable}
     WHERE is_published = 1
@@ -182,48 +191,27 @@ async function main() {
 
   console.log(`Found ${listings.length} published listings to process.\n`);
 
-  const tierCounts = {};
-  const templateUsage = {};
-  const agentUsage = {};
-  let totalImagesGenerated = 0;
+  const startTime = Date.now();
 
-  for (let i = 0; i < listings.length; i++) {
-    const prop = listings[i];
-
-    // Task 6: Dynamic Tier Calculation based on active fuzzed price
+  async function processListing(prop, i) {
     const tier = getPriceTier(prop.price);
-    tierCounts[tier] = (tierCounts[tier] || 0) + 1;
-
-    // Task 5: 20 Templates Round Robin
     const desc = generateDescription(prop, i);
-    templateUsage[desc.templateIndex] = (templateUsage[desc.templateIndex] || 0) + 1;
-
-    // Task 9: Fictional Agent Persona Assignment
     const agent = getAgentPersona(prop.id);
-    agentUsage[agent.agent_name] = (agentUsage[agent.agent_name] || 0) + 1;
 
-    // If LIVE execution:
     if (!isDryRun) {
-      // 1. Task 8: Replace images (only if NOT skipped)
+      // 1. Task 8: Images (if not skipped)
       if (!skipImages) {
         const images = sampleListingImages(tier, prop.bedrooms);
-        totalImagesGenerated += images.length;
-        await conn.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
+        await pool.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
         for (let pos = 0; pos < images.length; pos++) {
           if (isCloneImgSchema) {
-            await conn.query(`
-              INSERT INTO ${imgTable} (property_id, slug, image_url)
-              VALUES (?, ?, ?)
-            `, [
+            await pool.query(`INSERT INTO ${imgTable} (property_id, slug, image_url) VALUES (?, ?, ?)`, [
               prop.id,
               prop.slug || `property-${prop.id}`,
               images[pos].url
             ]);
           } else {
-            await conn.query(`
-              INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
-            `, [
+            await pool.query(`INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`, [
               prop.id,
               images[pos].url,
               images[pos].url,
@@ -235,124 +223,77 @@ async function main() {
         }
       }
 
-      // 2. Task 5: Update properties text
+      // 2. Task 5: Properties text
       if (hasHtmlInProp) {
-        await conn.query(`
+        await pool.query(`
           UPDATE ${propTable}
-          SET overview = ?,
-              frontend_overview = ?,
-              tts_clean_overview = ?,
-              tts_clean_overview_html = ?,
-              updated_at = NOW()
+          SET overview = ?, frontend_overview = ?, tts_clean_overview = ?, tts_clean_overview_html = ?, updated_at = NOW()
           WHERE id = ?
-        `, [
-          desc.overview,
-          desc.frontend_overview,
-          desc.tts_clean_overview,
-          desc.tts_clean_overview_html,
-          prop.id
-        ]);
+        `, [desc.overview, desc.frontend_overview, desc.tts_clean_overview, desc.tts_clean_overview_html, prop.id]);
       } else {
-        await conn.query(`
+        await pool.query(`
           UPDATE ${propTable}
-          SET overview = ?,
-              frontend_overview = ?,
-              tts_clean_overview = ?,
-              updated_at = NOW()
+          SET overview = ?, frontend_overview = ?, tts_clean_overview = ?, updated_at = NOW()
           WHERE id = ?
-        `, [
-          desc.overview,
-          desc.frontend_overview,
-          desc.tts_clean_overview,
-          prop.id
-        ]);
+        `, [desc.overview, desc.frontend_overview, desc.tts_clean_overview, prop.id]);
       }
 
-      // 3. Task 9: Anonymize Broker & Agent Info
+      // 3. Task 9: Agents info
       if (hasAgentTable) {
-        await conn.query(`
+        await pool.query(`
           UPDATE ${agentTable}
-          SET agent_name = ?,
-              agent_brokerage = ?,
-              agent_email = ?,
-              agent_phone = ?,
-              agent_img = ?,
-              frontend_agent_email = ?,
-              listing_courtesy_name = ?,
-              listing_courtesy_company = ?,
-              listing_courtesy_address = ?,
-              updated_at = NOW()
+          SET agent_name = ?, agent_brokerage = ?, agent_email = ?, agent_phone = ?, agent_img = ?,
+              frontend_agent_email = ?, listing_courtesy_name = ?, listing_courtesy_company = ?,
+              listing_courtesy_address = ?, updated_at = NOW()
           WHERE property_id = ?
         `, [
-          agent.agent_name,
-          agent.agent_brokerage,
-          agent.agent_email,
-          agent.agent_phone,
-          agent.agent_img,
-          agent.frontend_agent_email,
-          agent.listing_courtesy_name,
-          agent.listing_courtesy_company,
-          agent.listing_courtesy_address,
-          prop.id
+          agent.agent_name, agent.agent_brokerage, agent.agent_email, agent.agent_phone, agent.agent_img,
+          agent.frontend_agent_email, agent.listing_courtesy_name, agent.listing_courtesy_company,
+          agent.listing_courtesy_address, prop.id
         ]);
       }
 
-      // 4. Task 11: Sync Voiceover text & SILENCE old scraped audio MP3
+      // 4. Task 11: Voiceover sync & mute
       if (hasVoTable) {
-        await conn.query(`
+        await pool.query(`
           UPDATE ${voTable}
-          SET tts_clean_overview = ?,
-              tts_clean_overview_html = ?,
-              verified_tts_clean_overview = ?,
-              audio_url = NULL,
-              voice_over_url = NULL,
-              updated_at = NOW()
+          SET tts_clean_overview = ?, tts_clean_overview_html = ?, verified_tts_clean_overview = ?,
+              audio_url = NULL, voice_over_url = NULL, updated_at = NOW()
           WHERE property_id = ?
-        `, [
-          desc.tts_clean_overview,
-          desc.tts_clean_overview_html,
-          desc.tts_clean_overview,
-          prop.id
-        ]);
+        `, [desc.tts_clean_overview, desc.tts_clean_overview_html, desc.tts_clean_overview, prop.id]);
       }
-    }
-
-    if ((i + 1) % 250 === 0 || i === listings.length - 1) {
-      console.log(`Progress: [${i + 1}/${listings.length}] listings ${isDryRun ? 'simulated' : 'updated'}...`);
     }
   }
+
+  // Execute in concurrent parallel chunks
+  for (let i = 0; i < listings.length; i += CONCURRENCY) {
+    const chunk = listings.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map((prop, idx) => processListing(prop, i + idx)));
+
+    const currentCount = Math.min(i + chunk.length, listings.length);
+    if (currentCount % 250 < CONCURRENCY || currentCount === listings.length) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const rate = (currentCount / (elapsed || 0.1)).toFixed(1);
+      console.log(`Progress: [${currentCount}/${listings.length}] listings processed (${rate} listings/sec, ${elapsed}s elapsed)...`);
+    }
+  }
+
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
   console.log(`\n=================== BATCH SUMMARY ===================`);
   console.log(`Total Listings:           ${listings.length}`);
-  if (!skipImages) {
-    console.log(`Total Assigned Images:    ${totalImagesGenerated}`);
-  } else {
-    console.log(`Image Assignment:         SKIPPED (--skip-images active)`);
-  }
-  console.log(`\nPrice Tier Distribution:`);
-  for (let t = 1; t <= 10; t++) {
-    console.log(`  Tier ${String(t).padStart(2, ' ')}: ${tierCounts[t] || 0} listings`);
-  }
-
-  console.log(`\n20 Templates Distribution:`);
-  for (let tpl = 1; tpl <= TEMPLATES.length; tpl++) {
-    console.log(`  Template ${String(tpl).padStart(2, '0')}: ${templateUsage[tpl] || 0} uses`);
-  }
-
-  console.log(`\n10 Agent Personas Distribution:`);
-  Object.keys(agentUsage).forEach(name => {
-    console.log(`  ${name.padEnd(16)}: ${agentUsage[name]} listings (Brokerage: Renby Residential)`);
-  });
+  console.log(`Total Elapsed Time:       ${totalTime} seconds`);
+  console.log(`Average Speed:            ${(listings.length / totalTime).toFixed(1)} listings/second`);
   console.log(`=====================================================\n`);
 
   if (isDryRun) {
     console.log(`✓ DRY RUN COMPLETED SUCCESSFULLY. ZERO database writes occurred.`);
     console.log(`To execute live updates, run with: --execute\n`);
   } else {
-    console.log(`✓ LIVE PIPELINE BATCH EXECUTION COMPLETED SUCCESSFULLY!\n`);
+    console.log(`✓ LIVE PIPELINE BATCH EXECUTION COMPLETED SUCCESSFULLY IN ${totalTime}s!\n`);
   }
 
-  await conn.end();
+  await pool.end();
 }
 
 main().catch(err => {
