@@ -7,8 +7,8 @@ const args = process.argv.slice(2);
 const isExecute = args.includes('--execute');
 const isDryRun = !isExecute || args.includes('--dry-run');
 
-const targetArg = (args.find(a => a.startsWith('--target=')) || '--target=dev').split('=')[1];
-const tableArg = (args.find(a => a.startsWith('--table=')) || '--table=backup').split('=')[1];
+const targetArg = (args.find(a => a.startsWith('--target=')) || '--target=clone').split('=')[1];
+const tableArg = (args.find(a => a.startsWith('--table=')) || '--table=main').split('=')[1];
 const poolArg = (args.find(a => a.startsWith('--pool=')) || '--pool=test').split('=')[1];
 const limitArg = args.find(a => a.startsWith('--limit='));
 const limitVal = limitArg ? parseInt(limitArg.split('=')[1], 10) : null;
@@ -44,18 +44,18 @@ const imgTable = tableArg === 'backup' ? 'properties_images_backup' : 'propertie
 const agentTable = tableArg === 'backup' ? 'properties_agents_info_backup' : 'properties_agents_info';
 const voTable = tableArg === 'backup' ? 'properties_voice_over_backup' : 'properties_voice_over';
 
-// Task 9: 10 Neutral Agent Personas & In-House Brokerage
+// Task 9: 10 Fictional In-House Personas
 const AGENT_PERSONAS = [
-  { name: 'Alex Morgan', email: 'amorgan@renbyrealty.com' },
-  { name: 'Jordan Taylor', email: 'jtaylor@renbyrealty.com' },
-  { name: 'Casey Bennett', email: 'cbennett@renbyrealty.com' },
-  { name: 'Sam Rivera', email: 'srivera@renbyrealty.com' },
-  { name: 'Morgan Blake', email: 'mblake@renbyrealty.com' },
-  { name: 'Taylor Hayes', email: 'thayes@renbyrealty.com' },
-  { name: 'Riley Vance', email: 'rvance@renbyrealty.com' },
-  { name: 'Avery Brooks', email: 'abrooks@renbyrealty.com' },
-  { name: 'Devon Reed', email: 'dreed@renbyrealty.com' },
-  { name: 'Harper Quinn', email: 'hquinn@renbyrealty.com' }
+  { name: 'Alex Morgan', email: 'amorgan@renbyrealty.com', phone: '(212) 555-0101' },
+  { name: 'Jordan Taylor', email: 'jtaylor@renbyrealty.com', phone: '(212) 555-0102' },
+  { name: 'Casey Bennett', email: 'cbennett@renbyrealty.com', phone: '(212) 555-0103' },
+  { name: 'Sam Rivera', email: 'srivera@renbyrealty.com', phone: '(212) 555-0104' },
+  { name: 'Morgan Blake', email: 'mblake@renbyrealty.com', phone: '(212) 555-0105' },
+  { name: 'Taylor Hayes', email: 'thayes@renbyrealty.com', phone: '(212) 555-0106' },
+  { name: 'Riley Vance', email: 'rvance@renbyrealty.com', phone: '(212) 555-0107' },
+  { name: 'Avery Brooks', email: 'abrooks@renbyrealty.com', phone: '(212) 555-0108' },
+  { name: 'Devon Reed', email: 'dreed@renbyrealty.com', phone: '(212) 555-0109' },
+  { name: 'Harper Quinn', email: 'hquinn@renbyrealty.com', phone: '(212) 555-0110' }
 ];
 
 function getAgentPersona(propId) {
@@ -65,7 +65,9 @@ function getAgentPersona(propId) {
     agent_name: p.name,
     agent_brokerage: 'Renby Residential',
     agent_email: p.email,
+    agent_phone: p.phone,
     frontend_agent_email: p.email,
+    agent_img: null,
     listing_courtesy_name: 'Renby Residential',
     listing_courtesy_company: 'Renby Real Estate LLC',
     listing_courtesy_address: 'New York, NY 10001'
@@ -94,9 +96,9 @@ function sampleListingImages(tier, rawBeds) {
   const beds = parseInt(rawBeds, 10) || 0;
   const randIdx = () => String(Math.floor(Math.random() * POOL_SIZE) + 1).padStart(2, '0');
 
-  // Living Room (position 0)
+  // Living Room
   images.push({ category: 'living_room', url: `${CDN_BASE_URL}/${tierStr}/living_room/img_${randIdx()}.webp` });
-  // Kitchen (position 1)
+  // Kitchen
   images.push({ category: 'kitchen', url: `${CDN_BASE_URL}/${tierStr}/kitchen/img_${randIdx()}.webp` });
 
   // Bedrooms: 0 for Studio; 1 to 4 for 1BR+
@@ -147,9 +149,15 @@ async function main() {
   const [voTables] = await conn.query(`SHOW TABLES LIKE ?`, [voTable]);
   const hasVoTable = voTables.length > 0;
 
+  // Detect schema for properties_images
+  const [imgCols] = await conn.query(`DESCRIBE ${imgTable}`);
+  const imgColNames = imgCols.map(c => c.Field);
+  const isCloneImgSchema = imgColNames.includes('image_url'); // Clone DB uses image_url, slug
+
   console.log(`Auxiliary Table Detection:`);
   console.log(`  - Agents Table [${agentTable}]: ${hasAgentTable ? 'DETECTED' : 'Not found (will skip)'}`);
-  console.log(`  - Voice Table [${voTable}]:  ${hasVoTable ? 'DETECTED' : 'Not found (will skip)'}\n`);
+  console.log(`  - Voice Table  [${voTable}]:  ${hasVoTable ? 'DETECTED' : 'Not found (will skip)'}`);
+  console.log(`  - Images Schema: [${isCloneImgSchema ? 'Clone DB Schema (image_url, slug)' : 'Dev DB Schema (original_url, large_url...)'}]\n`);
 
   const queryLimit = limitVal ? `LIMIT ${limitVal}` : '';
   const [listings] = await conn.query(`
@@ -160,7 +168,7 @@ async function main() {
     ${queryLimit}
   `);
 
-  console.log(`Found ${listings.length} published listings to process in dry run.\n`);
+  console.log(`Found ${listings.length} published listings to process.\n`);
 
   const tierCounts = {};
   const templateUsage = {};
@@ -170,7 +178,7 @@ async function main() {
   for (let i = 0; i < listings.length; i++) {
     const prop = listings[i];
 
-    // Task 6: Dynamic Tier Calculation
+    // Task 6: Dynamic Tier Calculation based on active fuzzed price
     const tier = getPriceTier(prop.price);
     tierCounts[tier] = (tierCounts[tier] || 0) + 1;
 
@@ -188,20 +196,31 @@ async function main() {
 
     // If LIVE execution:
     if (!isDryRun) {
-      // 1. Task 8: Replace images
+      // 1. Task 8: Replace images matching the exact target schema
       await conn.query(`DELETE FROM ${imgTable} WHERE property_id = ?`, [prop.id]);
       for (let pos = 0; pos < images.length; pos++) {
-        await conn.query(`
-          INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
-        `, [
-          prop.id,
-          images[pos].url,
-          images[pos].url,
-          images[pos].url,
-          images[pos].url,
-          pos
-        ]);
+        if (isCloneImgSchema) {
+          await conn.query(`
+            INSERT INTO ${imgTable} (property_id, slug, image_url)
+            VALUES (?, ?, ?)
+          `, [
+            prop.id,
+            prop.slug || `property-${prop.id}`,
+            images[pos].url
+          ]);
+        } else {
+          await conn.query(`
+            INSERT INTO ${imgTable} (property_id, original_url, large_url, medium_url, small_url, position, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
+          `, [
+            prop.id,
+            images[pos].url,
+            images[pos].url,
+            images[pos].url,
+            images[pos].url,
+            pos
+          ]);
+        }
       }
 
       // 2. Task 5: Update properties text
@@ -228,6 +247,8 @@ async function main() {
           SET agent_name = ?,
               agent_brokerage = ?,
               agent_email = ?,
+              agent_phone = ?,
+              agent_img = ?,
               frontend_agent_email = ?,
               listing_courtesy_name = ?,
               listing_courtesy_company = ?,
@@ -238,6 +259,8 @@ async function main() {
           agent.agent_name,
           agent.agent_brokerage,
           agent.agent_email,
+          agent.agent_phone,
+          agent.agent_img,
           agent.frontend_agent_email,
           agent.listing_courtesy_name,
           agent.listing_courtesy_company,
@@ -267,11 +290,11 @@ async function main() {
     }
 
     if ((i + 1) % 250 === 0 || i === listings.length - 1) {
-      console.log(`Progress: [${i + 1}/${listings.length}] listings simulated...`);
+      console.log(`Progress: [${i + 1}/${listings.length}] listings ${isDryRun ? 'simulated' : 'updated'}...`);
     }
   }
 
-  console.log(`\n=================== SIMULATION SUMMARY ===================`);
+  console.log(`\n=================== BATCH SUMMARY ===================`);
   console.log(`Total Listings:           ${listings.length}`);
   console.log(`Total Assigned Images:    ${totalImagesGenerated}`);
   console.log(`\nPrice Tier Distribution:`);
@@ -288,13 +311,13 @@ async function main() {
   Object.keys(agentUsage).forEach(name => {
     console.log(`  ${name.padEnd(16)}: ${agentUsage[name]} listings (Brokerage: Renby Residential)`);
   });
-  console.log(`==========================================================\n`);
+  console.log(`=====================================================\n`);
 
   if (isDryRun) {
     console.log(`✓ DRY RUN COMPLETED SUCCESSFULLY. ZERO database writes occurred.`);
-    console.log(`All calculations for Tasks 5, 6, 8, 9, and 11 passed validation.\n`);
+    console.log(`To execute live updates, run with: --execute\n`);
   } else {
-    console.log(`✓ LIVE PIPELINE BATCH EXECUTION COMPLETED!\n`);
+    console.log(`✓ LIVE PIPELINE BATCH EXECUTION COMPLETED SUCCESSFULLY!\n`);
   }
 
   await conn.end();
